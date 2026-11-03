@@ -1,4 +1,6 @@
-# 4×RTX 5090 on a Consumer Intel Board — PEX88096 Build & Post-Mortem
+# 4×RTX 5090 on a Consumer Intel Board
+
+> ▶ **Live demo** (terminal replay of the build): https://harry-2546.github.io/4x5090-rig/ — PEX88096 Build & Post-Mortem
 
 A complete, dated engineering record of building a **4×RTX 5090 (128 GB VRAM) LLM inference rig** on an ASUS ROG STRIX **Z690-A** (Intel consumer platform) with a Broadcom **PEX88096** PCIe switch — a combination the public record said was uncharted (every documented 88096 success I could find was AM5 / EPYC / Threadripper).
 
