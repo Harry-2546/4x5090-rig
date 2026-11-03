@@ -1,0 +1,8 @@
+# /etc/systemd/system/nvidia-cdi-refresh.service.d/after-gpu-rebar.conf（v1.9 新增）
+[Unit]
+# Loading nvidia before gpu-rebar re-enumerates the switch resets BAR1 to 256M
+After=gpu-rebar.service
+
+   然后让 Docker 排在 `gpu-rebar` 之后，容器才不会在驱动加载前启动（`/etc/systemd/system/docker.service.d/after-gpu-rebar.conf`）：
+
+   

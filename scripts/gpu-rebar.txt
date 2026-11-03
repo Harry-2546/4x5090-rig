@@ -1,0 +1,175 @@
+#!/bin/bash
+# Grow RTX 5090 BAR1 to 32G and re-enumerate the PEX88096 tree, then load nvidia.
+# BIOS Re-Size BAR stays off (4 x 32G BARs hang POST); needs pci=nocrs so the
+# 192G bridge window can go above the BIOS 64-bit window.
+set -u
+ROOT_PORT=0000:00:01.0
+GPU_ID=10de:2b85
+BAR1_SIZE=$((32 << 30))
+
+gpus() { lspci -D -d "$GPU_ID" | cut -d" " -f1; }
+bar1() { sed -n 2p "/sys/bus/pci/devices/$1/resource"; }
+
+# If something loaded nvidia first (e.g. nvidia-cdi-refresh.service from
+# nvidia-container-toolkit), it binds the GPUs during rescan and resets
+# ReBAR to 256M. Unload it before touching the BARs.
+if grep -q "^nvidia " /proc/modules; then
+	echo "gpu-rebar: nvidia already loaded, unloading first"
+	modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia ||
+		echo "gpu-rebar: unload failed (GPU in use?)"
+fi
+
+need=0
+for d in $(gpus); do
+	ctrl=0x$(setpci -s "$d" ECAP15+8.l) || continue
+	if [ $(( (ctrl >> 8) & 0x3f )) -ne 15 ]; then
+		setpci -s "$d" COMMAND=0000:0002
+		setpci -s "$d" ECAP15+8.l=$(printf %08x $(( (ctrl & ~0x3f00) | (15 << 8) )))
+		need=1
+	fi
+	read -r s _ <<<"$(bar1 "$d")"
+	[ $((s)) -eq 0 ] && need=1
+done
+
+if [ $need -eq 1 ]; then
+	echo 1 > "/sys/bus/pci/devices/$ROOT_PORT/remove"
+	sleep 2
+	echo 1 > /sys/bus/pci/rescan
+	sleep 3
+fi
+
+n=0; ok=0
+for d in $(gpus); do
+	n=$((n + 1))
+	read -r s e _ <<<"$(bar1 "$d")"
+	[ $((s)) -ne 0 ] && [ $((e - s + 1)) -eq $BAR1_SIZE ] && ok=$((ok + 1))
+done
+echo "gpu-rebar: $ok/$n GPUs have a 32G BAR1"
+
+modprobe -a nvidia nvidia_uvm nvidia_modeset nvidia_drm
+[ $ok -eq $n ] && [ $n -gt 0 ]
+# /etc/systemd/system/gpu-rebar.service
+[Unit]
+Description=Resize GPU BAR1 to 32G, re-enumerate PCIe switch, load nvidia
+After=systemd-udev-settle.service systemd-modules-load.service local-fs.target
+Before=nvidia-persistenced.service nvidia-powerd.service multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gpu-rebar.sh
+
+[Install]
+WantedBy=multi-user.target
+sudo systemctl daemon-reload && sudo systemctl enable gpu-rebar.service
+# /etc/default/grub：GRUB_CMDLINE_LINUX_DEFAULT 末尾加 pci=nocrs（即下表 profile 3），然后 update-grub
+
+# 验证
+systemctl status gpu-rebar --no-pager                          # active (exited)
+journalctl -u gpu-rebar -b | grep gpu-rebar:                   # gpu-rebar: 4/4 GPUs have a 32G BAR1
+nvidia-smi -q -d MEMORY | grep -A2 "BAR1" | grep Total         # 4 行 32768 MiB
+sudo lspci -vv -s 00:01.0 | grep "Prefetchable memory behind"  # 约 192G
+
+- 这条规则**不会**挡住 `nvidia-container-toolkit` / `libnvidia-container*`：用 Docker 跑 r10 时需要它们。这个工具包带 `nvidia-cdi-refresh` 开机服务，必须排在 `gpu-rebar` 之后（见上方"4 卡 BAR"）。
+
+- CUDA 只装 `cuda-toolkit-X-Y`，**不装 `cuda` 元包**：它会依赖 `nvidia-driver-*`。
+- 不运行 `ubuntu-drivers autoinstall`。
+
+- 只 hold 具体版本号的内核包不够：元包还在的话，会把新内核作为依赖装进来（[R14]）。
+- unattended-upgrades：专用推理机建议直接停用（`sudo apt remove unattended-upgrades`），按下面的升级流程手动升级。
+  - 必须保留时，在 `/etc/apt/apt.conf.d/50unattended-upgrades` 的 `Package-Blacklist` 里加入 `linux-generic`、`linux-image-generic`、`linux-headers-generic`、`linux-modules-*`、`nvidia-*`（[R15]）。
+- 记录已知可用的版本组合：kernel、aikitoria commit、NVIDIA userspace、CUDA、vLLM / r10 overlay。
+  - **当前（2026-10-30）**：kernel 6.8.0-147；aikitoria 610.57.04-p2p-v3（commit 461d638b7a91）；CUDA 13.3；Docker 29.1.3；NVIDIA Container Toolkit 1.20.1；镜像 `qwen-pedia/fnext-vllm:r10`（`5b2088524a80`）；QWEN-PEDIA commit ed7901322730 + `launch.sh` 两处本地改动；模型 snapshot fc694b54fb01。
+- 升级流程：快照 / 备份启动环境 → 装新内核 → 重编补丁模块 → 跑 G1 → G4 → 全部通过才设为默认启动项。
+
+<!-- 已注释 v1.1：原驱动锁定说明，被上方"版本冻结"替代
+**驱动**：aikitoria open-gpu-kernel-modules **610.57.04**（[X01]），装好后 `apt-mark hold` 住 nvidia 相关包，防止升级把补丁覆盖掉。
+-->
+
+### 第 5 步：推理栈
+
+- 使用 **QWEN-PEDIA r10 配方**（Qwen3.8-Flash-Next 部署配方的第 10 版）及其固定的 vLLM 版本（[N03]）。
+  - 上游 vLLM 在超过 2 张 PCIe GPU 时会禁用 custom all-reduce（[X02]），所以不要用上游版本跑分去和基线比。
+- 环境变量：全部由 `launch.sh` 设置（含 `VLLM_CUSTOM_AR_ALLOW_PCIE=1`）。不要另外设置 `NCCL_P2P_LEVEL`；必须约束时用 PIX，不要用 SYS（[N06]）。启动日志应有 `Custom allreduce kept ENABLED on 4 PCIe-only GPUs`。日志里的 `Unknown vLLM environment variable` 警告可以忽略：这些变量是 overlay 读的，vLLM 原版不认识。
+
+<!-- 已注释 v1.9：launch.sh 已包含所需环境变量，实际部署没有手动 export
+- 环境变量：
+
+
+---
+
+## 4. 验收 Gate（前一级不过，不进下一级）
+
+| Gate | 方法 | 通过标准 |
+|---|---|---|
+| **G1 链路** | ① `lspci -vv` 看 **LnkCap 和 LnkSta**，LnkSta **在负载下看**（同时跑 `p2pBandwidthLatencyTest` 或 `nvbandwidth`）；② `dmesg \| grep -iE "no space\|failed to assign\|bridge window\|NVRM.*BAR"`；③ `nvidia-smi -q -d PCIE`、`dmesg \| grep -i aer` | ① 上行和 4 条下行的 LnkCap 都是 16GT/s x16；负载下 LnkSta 也是 16GT/s x16；空载时宽度仍是 x16、速率降到 2.5GT/s 属正常（[X18]）；② 无 BAR 分配失败，4 张卡 BAR1 都是 32GiB；③ 1h 内 AER 不增长；**连续冷启动 10 次，每次 4 张卡都识别** |
+| **G2 P2P** | `nvidia-smi topo -m`、`p2pBandwidthLatencyTest` 或 `nvbandwidth`、ACSCtl 检查 | 所有卡对为 PIX 或 PXB（本卡是两级 switch，§4.1），不能出现 PHB / NODE / SYS；单向 ≥ 24 GB/s，双向 ≥ 45 GB/s（社区实测 25–28 / 约 52，[M03], [M04], [M05]）；PEX 所有 function 的 ReqRedir / CmpltRedir / EgressCtrl 为 `-` |
+| **G3 NCCL** | `all_reduce_perf -b 8M -e 1G -f 2 -g 4` | 记录 busbw；1GB 时低于 15 GB/s 视为异常 |
+| **G4 应用** | 先测 r10 真实内存峰值（§3 第 1 步第 3 点）；再跑 r10，TP4 + EP，固定 prompt 和功率上限 | ≥ r10 基线的 90%：≥ 95 steps/s，decode ≥ 290 tok/s，prefill ≥ 7,000 tok/s；内存峰值无 OOM，`vmstat` 的 si/so 接近 0 |
+| **G5 A/B** | `NCCL_P2P_DISABLE=1` + 关掉 custom AR，重跑 G4 | 记录 P2P 带来的 pp / tg 差值 |
+| **G6 稳定性** | 先完成 §2.4 有人值守的 1 小时满载；再跑 24h 服务压测，`dmesg \| grep -i xid`；记录 PDU 电压 / 电流；红外测温：10-30 墙插、adapter 两端、L6-30 接头、PDU 输入线、各 12V-2x6 | 无 Xid、无掉卡；PDU 持续电流 ≤ 24A（30A × 80%）；负载下电压降 ≤ 约 2%；各接头温升满足 §2.4 第 8 条 |
+
+<!-- 已注释 v1.8：原 G2 行开头
+| **G2 P2P** | `nvidia-smi topo -m`、`p2pBandwidthLatencyTest`、ACSCtl 检查 | 所有卡对为 PIX；
+-->
+
+<!-- 已注释 v1.3：原 G6 行，按 115V 双回路判定
+| **G6 稳定性** | 24h 服务压测，`dmesg \| grep -i xid`，红外测温 12V-2x6 接头，**墙端功率计 / 钳形表** | 无 Xid、无掉卡、接头温度正常；每条回路实测持续电流 ≤ 断路器额定值的 80% |
+-->
+
+<!-- 已注释 v1.2：原 G1 行，LnkSta 未区分空载 / 负载
+| **G1 链路** | ① `lspci -vv` 看 **LnkCap 和 LnkSta**；② `dmesg \| grep -iE "no space\|failed to assign\|bridge window\|NVRM.*BAR"`；③ `nvidia-smi -q -d PCIE`、`dmesg \| grep -i aer` | ① 上行和 4 条下行的 LnkCap、LnkSta 都是 16GT/s x16；② 无 BAR 分配失败，4 张卡 BAR1 都是 32GiB；③ 1h 内 AER 不增长；**连续冷启动 10 次，每次 4 张卡都识别** |
+-->
+
+**G1 的 LnkCap / LnkSta 判定：**
+
+| LnkCap | LnkSta | 判断 |
+|---|---|---|
+| Gen4 x16 | Gen4 x16 | 通过 |
+| Gen4 x16 | 空载时速率 2.5GT/s、宽度 x16 | 正常省电，加负载复查 |
+| Gen4 x16 | **负载下**速率偏低，或任何时候宽度低于 x16 | 线材 / 训练 / 主板问题，按 §5 排查 |
+| 偏低（如 Gen1 x4） | 偏低 | switch 卡配置问题（根因有争议，[X17]），退货 |
+
+<!-- 已注释 v1.2：原行未区分空载 / 负载
+| Gen4 x16 | 偏低（Gen1–3 或 x8 以下） | 线材 / 训练 / 主板问题，按 §5 排查 |
+-->
+
+<!-- 已注释 v1.1：原 G1 行，被上方两层判定替代
+| **G1 链路** | `lspci -vv`（LnkSta）、`nvidia-smi -q -d PCIE`、`dmesg \| grep -i aer` | 上行和 4 条下行都是 16GT/s x16；1h 内 AER 不增长；**连续冷启动 10 次，每次 4 张卡都识别** |
+-->
+
+出现以下任一情况，**先查硬件链路，不要调 vLLM**：单向只有 10–15 GB/s、某张卡明显偏低、拓扑出现 PHB / NODE / SYS（走了 CPU）、链路掉到 Gen3/Gen2。
+
+<!-- 已注释 v1.8：PXB 在本卡上属正常
+出现以下任一情况，**先查硬件链路，不要调 vLLM**：单向只有 10–15 GB/s、某张卡明显偏低、拓扑不是 PIX、链路掉到 Gen3/Gen2。
+-->
+
+### 4.1 硬件实测记录（2026-10-28 – 10-30）
+
+| 项目 | 结果 | 判定 |
+|---|---|---|
+| switch | `1000:c010`；上行 LnkCap / LnkSta Gen4 x16；卡内两级结构 | ✅ |
+| 单卡（A 口） | Gen4 x16，BAR1 32GiB，AER 0；H2D 23.66 / D2H 28.43 GB/s | ✅ |
+| 双卡 P2P | 单向 28.2 GB/s（CE）/ 26.7（SM）；双向 56.5 / 45.2 | ✅ G2 |
+| 4 卡识别 | 4 张都是 Gen4 x16，BAR1 都是 32GiB（ReBAR Off + `gpu-rebar.service`）；`topo -p2p r` 全部 OK | ✅ |
+| 4 卡 P2P（拷贝引擎，12 对） | 单向每对 28.57 GB/s（合计 342.9）；双向每对 56.5 GB/s（合计 677.7）；各对之间差异为 0 | ✅ G2 |
+| 拓扑 | 同一个下级 switch 下的那一对卡显示 PIX，其余卡对显示 PXB | 正常 |
+| 错误 | Xid / AER / DMAR 都是 0 | ✅ |
+| 负载下链路（v1.9） | r10 推理时 `nvidia-smi` 的 `pcie.link.gen.current` / `width.current`：4 张卡都是 Gen4 x16 | ✅ G1 这一项 |
+| 重启（v1.9） | 热重启 3 次：第 1 次 4/4；装 toolkit 后第 2 次 0/4（§3 第 4 步"4 卡 BAR"的 v1.9 补充）；修复后第 3 次 4/4，且驱动、超频、Docker 顺序正确 | ✅（冷启动未测） |
+| 版本 | kernel 6.8.0-147（hold）；aikitoria 610.57.04-p2p-v3（commit 461d638b7a91f73702001e343ec91b275a43ec35）；CUDA 13.3 | — |
+
+- `nvidia-smi` 的卡号（0–3）按 PCI 地址排序，和 §2 按电源命名的 GPU0–GPU3 不一定一致。设按卡功率上限前，用 `nvidia-smi --query-gpu=index,pci.bus_id --format=csv` 对照 `lspci -tv` 找到每张卡接在哪个口。
+- 其他实测：switch 接上后 PCI 总线号整体后移，板载网卡名从 `enp4s0` 变成了 `enp22s0`，导致开机断网；netplan 已改为按 MAC 地址匹配（`match: macaddress`），以后加减设备不受影响。
+- **还没做**：G1 的"冷启动 10 次"；§2.4 的 4 卡满载 1 小时（需要有人在场，要带着 NVML +4000 跑）；E 口、转接板 5、线 9/10 单独测试；G5、G6；DDR4-3600 的内存压力测试（v1.9 补充）。G3 跳过（最小化测试，直接用 r10 验证）。部署全部结束后撤销免密 sudo：`sudo rm /etc/sudoers.d/90-USER-nopasswd`。
+
+<!-- 已注释 v1.9（2026-11-01）：原待办，未含 3600 内存压力测试
+- **还没做**：G1 的"冷启动 10 次"；§2.4 的 4 卡满载 1 小时（需要有人在场，要带着 NVML +4000 跑）；E 口、转接板 5、线 9/10 单独测试；G5、G6。G3 跳过（最小化测试，直接用 r10 验证）。部署全部结束后撤销免密 sudo：`sudo rm /etc/sudoers.d/90-USER-nopasswd`。
+-->
+
+<!-- 已注释 v1.9：原待办
+- **还没做**：G1 的"负载下 LnkSta"和"冷启动 10 次"；§2.4 的 4 卡满载 1 小时（需要有人在场）；E 口、转接板 5、线 9/10 单独测试；G3–G6。
+-->
+
+**手动复测 P2P**：
+

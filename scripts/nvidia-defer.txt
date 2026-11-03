@@ -1,0 +1,6 @@
+# /etc/modprobe.d/nvidia-defer.conf
+# Loaded by gpu-rebar.service after BAR1 is resized; do not autoload.
+blacklist nvidia
+blacklist nvidia_drm
+blacklist nvidia_modeset
+blacklist nvidia_uvm

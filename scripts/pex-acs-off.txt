@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/pex-acs-off.sh
+# 先用 lspci -nn 确认 switch 的 vendor ID：Broadcom 为 1000，旧 PLX 为 10b5
+set -euo pipefail
+for vid in 1000 10b5; do
+  for dev in $(lspci -D -d "${vid}:" | awk '/PCI bridge/ {print $1}'); do
+    setpci -s "$dev" ECAP_ACS+0x6.w=0000 || true
+  done
+done
+# /etc/systemd/system/pex-acs-off.service
+[Unit]
+Description=Disable ACS on PEX88096 bridges
+Before=nvidia-persistenced.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pex-acs-off.sh
+[Install]
+WantedBy=multi-user.target
