@@ -1,6 +1,5 @@
 # 4×RTX 5090 on a Consumer Intel Board
 
-> ▶ **Live demo** (terminal replay of the build): https://harry-2546.github.io/4x5090-rig/ — PEX88096 Build & Post-Mortem
 
 A complete, dated engineering record of building a **4×RTX 5090 (128 GB VRAM) LLM inference rig** on an ASUS ROG STRIX **Z690-A** (Intel consumer platform) with a Broadcom **PEX88096** PCIe switch — a combination the public record said was uncharted (every documented 88096 success I could find was AM5 / EPYC / Threadripper).
 
@@ -21,16 +20,8 @@ This repo is written as a **journey, not a highlight reel**: every revision of t
 | `plan/88096-candidate-vetting-*.md`, `88096-reddit-sellers-*.md` | Hardware vetting: seller forensics, DIP settings, PSU/power-tree design ("same-card-same-source" rule) |
 | `research/report.md` | Companion survey: **1,096 deduped sources** (GitHub/Reddit/HF) on what 128 GB of Blackwell can run — methodology stated, gaps marked as gaps |
 | `scripts/` | `gpu-rebar` (the BAR fix), `gpu-memoc` (VRAM offset), `pex-acs-off`, cdi-refresh ordering drop-in |
-| `demo/` | Interactive HTML visual explainer of the topology and numbers |
 
 ## The honest part
 
 A full table of *our own wrong conclusions and how measurement killed them* is in the journey doc (`plan/pc2-4x5090-journey-*.md`, §"errors and corrections"): a bottleneck attribution we revised twice, a YaRN configuration that had silently never been active, benchmark scores whose test order created the effect, and headline numbers whose composition we had to decompose before trusting. We keep them in because a build log without its corrections is advertising.
 
-## Safety notes
-
-The electrical section (`plan/...v1.9.md` §2.2–2.5: 240 V via NEMA 10-30, PDU, synchronized multi-PSU start, and its **known risks and accepted tradeoffs**) is reproduced verbatim with its warnings. It documents *our* installation; it is not advice for yours.
-
-*Hostnames, IPs, MACs and local usernames are redacted in this public copy.*
-
-— Harry · built Oct 6 – Nov 3, 2026 · rig running continuously since
