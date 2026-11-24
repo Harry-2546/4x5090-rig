@@ -10,6 +10,8 @@ This repo is written as a **journey, not a highlight reel**: every revision of t
 - 3 of 4 GPUs would not POST. Root cause: the BIOS reserves a **256 GB 64-bit MMIO window**; each 5090 consumes ~64 GB of it (32 GiB BAR1 × 32 GB alignment + BAR3). Solution: BIOS Re-Size BAR off + `pci=nocrs` + a boot service that reprograms each card's BAR1 to 32 GiB via `setpci` and re-enumerates the switch tree before the driver loads.
 - P2P over the switch measured **28.6 GB/s per pair unidirectional / 56.5 bidirectional** (copy engine), 4/4 links Gen4 ×16, Xid/AER/DMAR zero.
 - Serving [Qwen3.8-Flash-Next NVFP4 (QWEN-PEDIA r10)](https://github.com/abtraore/QWEN-PEDIA) on vLLM TP4+EP: **116 steps/s vs the author's 106 baseline**, ~1,200 tok/s at 8-way concurrency. Full benchmark methodology lives in the companion repo [`llm-inference-bench`](https://github.com/Harry-2546/llm-inference-bench).
+- Later (2026-11-21), the FP4-Local checkpoint on upstream vLLM plus three unmerged PRs: **379 tok/s single-stream, 1,375 tok/s 8-way, 4.65 s TTFT on a cold 60K prompt**, with a 56 GB CPU KV tier in host RAM. Per-change A/B table and patches: [`llm-inference-bench/pc2/fast-2026-11`](https://github.com/Harry-2546/llm-inference-bench/tree/master/pc2/fast-2026-11).
+- How one 32 GB card is spent at a 524K context: ~1.5 GiB CUDA context/NCCL, 22.8 GiB weights, 4.5 GiB fp8 KV (594K tokens), 0.24 GiB CUDA graphs, ~1–2 GiB left for activations. The 27 GiB n-gram embedding table lives in pinned host RAM, so 128 GB of system memory is not optional.
 
 ## Contents
 
